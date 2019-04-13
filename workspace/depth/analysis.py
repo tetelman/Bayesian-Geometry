@@ -125,6 +125,13 @@ def get_blur(img, kernel):
     img = F.conv2d(img, kernel, padding=padding, groups=num_ch)
     return img
 
+def make_grid(size, log=False):
+    affine = torch.eye(2, 3).unsqueeze(0)
+    grid_size = (1, 1, size[0], size[1])
+    grid = F.affine_grid(affine, grid_size)
+    print('grid.size=', grid.size())
+    return grid
+
 def find_depth_rgb(t_images, dir_out):
     size = list(t_images[0]['img'].size()[2:])
 # define parameters
@@ -137,10 +144,7 @@ def find_depth_rgb(t_images, dir_out):
 
     params = nn.ParameterList([a2, a1, b1, c1, d0, d1])
 
-    affine = torch.eye(2, 3).unsqueeze(0)
-    grid_size = (1, 1, size[0], size[1])
-    grid = F.affine_grid(affine, grid_size)
-    print('grid.size=', grid.size())
+    grid = make_grid(size)
 
     d1_grid = F.interpolate(d1, size, mode='bilinear').squeeze(1).unsqueeze(3)
     print(d1_grid.size())
@@ -160,7 +164,7 @@ def find_depth_rgb(t_images, dir_out):
     aloss = 1
 
     num_ch = t_images[0]['img'].size(1)
-    
+
     ksize0 = 5
     for epoch in range(1, num_epochs+1):
         ksize = 1 + 2*int((ksize0 - 1)/2 * 1./(1 + 0*(epoch-1)))
@@ -168,7 +172,7 @@ def find_depth_rgb(t_images, dir_out):
         kernel = make_gauss_kernel(num_ch, ksize, std)
         img = t_images[1]['img']
         img = get_blur(img, kernel)
-    
+
         for s in range(num_steps):
 
             d1_grid = F.interpolate(d1, size, mode='bilinear').squeeze(1).unsqueeze(3)
@@ -207,7 +211,7 @@ def find_depth_feat(t_images, dir_out):
 
     img = t_images[0]['img']
 
-    skernel = make_gauss_kernel(num_ch, 5)
+    skernel = make_gauss_kernel(num_ch, 9)
     img = get_blur(img, skernel)
 
     gkernel = make_grad_kernel(num_ch)
@@ -221,14 +225,64 @@ def find_depth_feat(t_images, dir_out):
     for i in range(grad_img1.size(1)):
         image_save_t(grad_img1.narrow(1, i, 1), dir_out, 'grad_'+str(i)+'.png', log=True)
 
-    grey = t_images[0]['img'].mean(1, keepdim=True)
-    sk = make_gauss_kernel(1, 5)
-    grey = get_blur(grey, sk)
+    greys = []
+    greys_grads = []
+    greys_grad1 = []
+    for i in range(len(t_images)):
+        grey = t_images[i]['img'].mean(1, keepdim=True)
+        sk = make_gauss_kernel(1, 5)
+        grey = get_blur(grey, sk)
+        greys.append(grey)
 
-    gk = make_grad_kernel(1)
-    grad_grey = get_grad_map(grey, gk)
-    grad_grey1 = (grad_grey[0][0].pow(2) + grad_grey[0][1].pow(2)).sqrt().unsqueeze(0).unsqueeze(0)
-    image_save_t(grad_grey1, dir_out, 'grad_grey.png', log=True)
+        gk = make_grad_kernel(1)
+        grad_grey = get_grad_map(grey, gk)
+        greys_grad1.append(grad_grey)
+        grad_grey1 = (grad_grey[0][0].pow(2) + grad_grey[0][1].pow(2)).sqrt().unsqueeze(0).unsqueeze(0)
+        image_save_t(grad_grey1, dir_out, 'grad_grey_'+str(i)+'.png', log=True)
+        greys_grads.append(grad_grey1)
+
+    # image -> universal features ->
+    # from universal feat get compositional feat w/min collisions for same image and stable under deformations
+    size = greys[0].size()[2:]
+    grid = make_grid(size, log=True)
+# print(grid[0, 0:3, 0:3, 1])
+    target = grid.permute([0, 3, 1, 2])
+    lr = 0.01
+    ksize = 19
+    num_steps = 1000
+    numf = 4
+    inp_img0 = torch.cat([greys[0], greys_grad1[0], greys_grads[0]], 1) #.requires_grad_()
+    inp_mean = inp_img0.mean([2, 3], keepdim=True)
+    inp_img = inp_img0 - inp_mean
+# tar_mean = target.mean([2, 3], keepdim=True)
+# print(tar_mean[0].min(dim=0)[0].item(), tar_mean[0].max(dim=0)[0].item())
+    print(inp_img.size())
+# inp = inp_img.view(inp_img.size(1), -1)
+    ksize2 = ksize**2
+    krn = torch.Tensor(inp_img.size(1)*ksize2, inp_img.size(1), ksize2).zero_()
+    count = 0
+    for i in range(inp_img.size(1)):
+        for j in range(ksize2):
+            krn[count][i][j] = 1
+            count += 1
+    krn = krn.view(inp_img.size(1)*ksize2, inp_img.size(1), ksize, ksize)
+    inp = F.conv2d(inp_img, krn, padding=(ksize-1)//2)
+    print(inp.size())
+    inp = inp.view(inp.size(1), -1)
+    A = inp.matmul(inp.t())
+    B = inp.matmul(target.view(2, -1).t())
+    C = A.pinverse().matmul(B)
+    weight = C.t().view(2, inp_img.size(1), ksize, ksize)
+    print(A.size(), B.size(), C.size(), weight.size())
+    pred = F.conv2d(inp_img, weight, padding=(ksize-1)//2)
+    loss = (pred - target).pow(2).mean(1, keepdim=True)
+    loss_mean = loss.mean()
+    print('loss=', loss_mean.item(), 'loss min,max, med:', loss.min().item(), loss.max().item(), loss.median().item())
+    loss_map = loss.lt(0.1).float()
+    print(loss_map.size(), loss_map.min().item(), loss_map.max().item())
+    print('sum loss thresh:', loss_map.sum().item())
+    image_save_t(loss_map, dir_out, 'loss_map.png', log=True)
+    image_save_t(loss, dir_out, 'loss_map_f.png', log=True)
 
 
 
@@ -249,7 +303,7 @@ def main():
         simg = (np.array(images[0]['img']) + np.array(images[1]['img']))*0.5
         image_save_np(simg, dir_out, 'simg.png', log=True)
 
-    # torch image test 
+    # torch image test
     resize = (400, 300)
     t_images = load_all_images_t(files, resize)
 
